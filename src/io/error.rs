@@ -2,9 +2,6 @@ use alloc::{boxed::Box, fmt};
 use core::result;
 
 pub mod core_error {
-    #[cfg(feature = "rust_before_181")]
-    pub use crate::io::cherry_picking::error::Error;
-    #[cfg(not(feature = "rust_before_181"))]
     pub use core::error::Error;
 }
 
@@ -54,7 +51,6 @@ pub type Result<T> = result::Result<T, Error>;
 /// [`Read`]: crate::io::Read
 /// [`Write`]: crate::io::Write
 /// [`Seek`]: crate::io::Seek
-
 pub enum Error {
     Os(i64),
     Simple(ErrorKind),
@@ -824,7 +820,6 @@ impl Error {
     /// assert!(io_error.raw_os_error().is_none());
     /// # }
     /// ```
-    #[cfg(not(feature = "rust_before_181"))]
     pub fn downcast<E>(self) -> result::Result<E, Self>
     where
         E: core_error::Error + Send + Sync + 'static,
