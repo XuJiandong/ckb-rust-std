@@ -2,6 +2,9 @@
 #![no_std]
 #![allow(clippy::doc_lazy_continuation)]
 
+#[cfg(test)]
+extern crate std;
+
 extern crate alloc;
 
 #[cfg(not(doctest))]

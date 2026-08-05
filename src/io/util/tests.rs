@@ -1,5 +1,8 @@
 use crate::io::prelude::*;
-use crate::io::{empty, repeat, sink, BorrowedBuf, Empty, Repeat, SeekFrom, Sink};
+use crate::io::{empty, repeat, sink, BorrowedBuf, Empty, ErrorKind, Repeat, SeekFrom, Sink};
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
 use core::mem::MaybeUninit;
 
 #[test]
@@ -19,29 +22,89 @@ fn empty_reads() {
     assert_eq!(e.read(&mut [0; 1024]).unwrap(), 0);
     assert_eq!(Read::by_ref(&mut e).read(&mut [0; 1024]).unwrap(), 0);
 
+    e.read_exact(&mut []).unwrap();
+    assert_eq!(
+        e.read_exact(&mut [0]).unwrap_err().kind(),
+        ErrorKind::UnexpectedEof
+    );
+    assert_eq!(
+        e.read_exact(&mut [0; 1024]).unwrap_err().kind(),
+        ErrorKind::UnexpectedEof
+    );
+
     let buf: &mut [MaybeUninit<_>] = &mut [];
     let mut buf: BorrowedBuf<'_> = buf.into();
     e.read_buf(buf.unfilled()).unwrap();
     assert_eq!(buf.len(), 0);
-    assert_eq!(buf.init_len(), 0);
+    assert!(!buf.is_init());
 
     let buf: &mut [_] = &mut [MaybeUninit::uninit()];
     let mut buf: BorrowedBuf<'_> = buf.into();
     e.read_buf(buf.unfilled()).unwrap();
     assert_eq!(buf.len(), 0);
-    assert_eq!(buf.init_len(), 0);
+    assert!(!buf.is_init());
 
     let buf: &mut [_] = &mut [MaybeUninit::uninit(); 1024];
     let mut buf: BorrowedBuf<'_> = buf.into();
     e.read_buf(buf.unfilled()).unwrap();
     assert_eq!(buf.len(), 0);
-    assert_eq!(buf.init_len(), 0);
+    assert!(!buf.is_init());
 
     let buf: &mut [_] = &mut [MaybeUninit::uninit(); 1024];
     let mut buf: BorrowedBuf<'_> = buf.into();
     Read::by_ref(&mut e).read_buf(buf.unfilled()).unwrap();
     assert_eq!(buf.len(), 0);
-    assert_eq!(buf.init_len(), 0);
+    assert!(!buf.is_init());
+
+    let buf: &mut [MaybeUninit<_>] = &mut [];
+    let mut buf: BorrowedBuf<'_> = buf.into();
+    e.read_buf_exact(buf.unfilled()).unwrap();
+    assert_eq!(buf.len(), 0);
+    assert!(!buf.is_init());
+
+    let buf: &mut [_] = &mut [MaybeUninit::uninit()];
+    let mut buf: BorrowedBuf<'_> = buf.into();
+    assert_eq!(
+        e.read_buf_exact(buf.unfilled()).unwrap_err().kind(),
+        ErrorKind::UnexpectedEof
+    );
+    assert_eq!(buf.len(), 0);
+    assert!(!buf.is_init());
+
+    let buf: &mut [_] = &mut [MaybeUninit::uninit(); 1024];
+    let mut buf: BorrowedBuf<'_> = buf.into();
+    assert_eq!(
+        e.read_buf_exact(buf.unfilled()).unwrap_err().kind(),
+        ErrorKind::UnexpectedEof
+    );
+    assert_eq!(buf.len(), 0);
+    assert!(!buf.is_init());
+
+    let buf: &mut [_] = &mut [MaybeUninit::uninit(); 1024];
+    let mut buf: BorrowedBuf<'_> = buf.into();
+    assert_eq!(
+        Read::by_ref(&mut e)
+            .read_buf_exact(buf.unfilled())
+            .unwrap_err()
+            .kind(),
+        ErrorKind::UnexpectedEof,
+    );
+    assert_eq!(buf.len(), 0);
+    assert!(!buf.is_init());
+
+    let mut buf = Vec::new();
+    assert_eq!(e.read_to_end(&mut buf).unwrap(), 0);
+    assert_eq!(buf, vec![]);
+    let mut buf = vec![1, 2, 3];
+    assert_eq!(e.read_to_end(&mut buf).unwrap(), 0);
+    assert_eq!(buf, vec![1, 2, 3]);
+
+    let mut buf = String::new();
+    assert_eq!(e.read_to_string(&mut buf).unwrap(), 0);
+    assert_eq!(buf, "");
+    let mut buf = String::from("hello");
+    assert_eq!(e.read_to_string(&mut buf).unwrap(), 0);
+    assert_eq!(buf, "hello");
 }
 
 #[test]

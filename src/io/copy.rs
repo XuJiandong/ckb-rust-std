@@ -40,15 +40,10 @@ use core::mem::MaybeUninit;
 /// }
 /// ```
 ///
-/// # Platform-specific behavior
-///
-/// On Linux (including Android), this function uses `copy_file_range(2)`,
-/// `sendfile(2)` or `splice(2)` syscalls to move data directly between file
-/// descriptors if possible.
-///
-/// Note that platform-specific behavior [may change in the future][changes].
-///
-/// [changes]: crate::io#platform-specific-behavior
+/// Unlike `std::io::copy`, this implementation does not use OS-specific
+/// optimizations such as `copy_file_range(2)`, `sendfile(2)` or `splice(2)`,
+/// as this crate targets `no_std` environments. It always copies through a
+/// stack buffer.
 pub fn copy<R: ?Sized + Read, W: ?Sized + Write>(reader: &mut R, writer: &mut W) -> Result<u64> {
     stack_buffer_copy(reader, writer)
 }

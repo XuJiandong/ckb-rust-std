@@ -220,7 +220,16 @@ impl<W: ?Sized + Write> BufWriter<W> {
         impl Drop for BufGuard<'_> {
             fn drop(&mut self) {
                 if self.written > 0 {
-                    self.buffer.drain(..self.written);
+                    // Like `self.buffer.drain(..self.written)` but more obviously
+                    // preserving the spare capacity; see note above.
+                    let new_len = self.buffer.len() - self.written;
+                    // SAFETY: Assumes `Vec::as_mut_slice` will not
+                    // de-initialize any elements of `self.buf`'s spare capacity,
+                    // and that `<&mut [u8]>::copy_within` will not do so either.
+                    self.buffer.as_mut_slice().copy_within(self.written.., 0);
+                    // SAFETY: Assumes `Vec::truncate` will not de-initialize
+                    // any elements of `self.buf`'s spare capacity,
+                    self.buffer.truncate(new_len);
                 }
             }
         }
@@ -482,19 +491,12 @@ impl WriterPanicked {
     pub fn into_inner(self) -> Vec<u8> {
         self.buf
     }
+}
+impl error::Error for WriterPanicked {}
 
-    const DESCRIPTION: &'static str =
-        "BufWriter inner writer panicked, what data remains unwritten is not known";
-}
-impl error::Error for WriterPanicked {
-    #[allow(deprecated, deprecated_in_future)]
-    fn description(&self) -> &str {
-        Self::DESCRIPTION
-    }
-}
 impl fmt::Display for WriterPanicked {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", Self::DESCRIPTION)
+        "BufWriter inner writer panicked, what data remains unwritten is not known".fmt(f)
     }
 }
 impl fmt::Debug for WriterPanicked {
