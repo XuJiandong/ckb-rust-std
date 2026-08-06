@@ -7,7 +7,9 @@ mod linewritershim;
 #[cfg(test)]
 mod tests;
 
+use crate::io::error::core_error::Error as CoreError;
 use crate::io::Error;
+use alloc::fmt;
 
 pub use self::{bufreader::BufReader, bufwriter::BufWriter, linewriter::LineWriter};
 use linewritershim::LineWriterShim;
@@ -164,5 +166,13 @@ impl<W> IntoInnerError<W> {
 impl<W> From<IntoInnerError<W>> for Error {
     fn from(iie: IntoInnerError<W>) -> Error {
         iie.1
+    }
+}
+
+impl<W: Send + fmt::Debug> CoreError for IntoInnerError<W> {}
+
+impl<W> fmt::Display for IntoInnerError<W> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error().fmt(f)
     }
 }

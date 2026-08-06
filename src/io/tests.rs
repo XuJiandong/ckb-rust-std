@@ -8,6 +8,150 @@ use crate::io::{cmp, error::ErrorKind, BufRead, BufReader, Read, Seek};
 use crate::io::{Error, DEFAULT_BUF_SIZE};
 
 #[test]
+fn take_seek() -> io::Result<()> {
+    let mut buf = Cursor::new(b"0123456789");
+    buf.set_position(2);
+    let mut take = buf.by_ref().take(4);
+    let mut buf1 = [0u8; 1];
+    let mut buf2 = [0u8; 2];
+    assert_eq!(take.position(), 0);
+
+    assert_eq!(take.seek(SeekFrom::Start(0))?, 0);
+    take.read_exact(&mut buf2)?;
+    assert_eq!(buf2, [b'2', b'3']);
+    assert_eq!(take.seek(SeekFrom::Start(1))?, 1);
+    take.read_exact(&mut buf2)?;
+    assert_eq!(buf2, [b'3', b'4']);
+    assert_eq!(take.seek(SeekFrom::Start(2))?, 2);
+    take.read_exact(&mut buf2)?;
+    assert_eq!(buf2, [b'4', b'5']);
+    assert_eq!(take.seek(SeekFrom::Start(3))?, 3);
+    take.read_exact(&mut buf1)?;
+    assert_eq!(buf1, [b'5']);
+    assert_eq!(take.seek(SeekFrom::Start(4))?, 4);
+    assert_eq!(take.read(&mut buf1)?, 0);
+
+    assert_eq!(take.seek(SeekFrom::End(0))?, 4);
+    assert_eq!(take.seek(SeekFrom::End(-1))?, 3);
+    take.read_exact(&mut buf1)?;
+    assert_eq!(buf1, [b'5']);
+    assert_eq!(take.seek(SeekFrom::End(-2))?, 2);
+    take.read_exact(&mut buf2)?;
+    assert_eq!(buf2, [b'4', b'5']);
+    assert_eq!(take.seek(SeekFrom::End(-3))?, 1);
+    take.read_exact(&mut buf2)?;
+    assert_eq!(buf2, [b'3', b'4']);
+    assert_eq!(take.seek(SeekFrom::End(-4))?, 0);
+    take.read_exact(&mut buf2)?;
+    assert_eq!(buf2, [b'2', b'3']);
+
+    assert_eq!(take.seek(SeekFrom::Current(0))?, 2);
+    take.read_exact(&mut buf2)?;
+    assert_eq!(buf2, [b'4', b'5']);
+
+    assert_eq!(take.seek(SeekFrom::Current(-3))?, 1);
+    take.read_exact(&mut buf2)?;
+    assert_eq!(buf2, [b'3', b'4']);
+
+    assert_eq!(take.seek(SeekFrom::Current(-1))?, 2);
+    take.read_exact(&mut buf2)?;
+    assert_eq!(buf2, [b'4', b'5']);
+
+    assert_eq!(take.seek(SeekFrom::Current(-4))?, 0);
+    take.read_exact(&mut buf2)?;
+    assert_eq!(buf2, [b'2', b'3']);
+
+    assert_eq!(take.seek(SeekFrom::Current(2))?, 4);
+    assert_eq!(take.read(&mut buf1)?, 0);
+
+    Ok(())
+}
+
+#[test]
+fn take_seek_error() {
+    let mut take = Cursor::new(b"").take(0);
+    assert_eq!(
+        take.seek(SeekFrom::Current(-1)).unwrap_err().kind(),
+        ErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn take_seek_big_offsets() -> io::Result<()> {
+    let mut take = Cursor::new(b"0123456789").take(10);
+    assert_eq!(
+        take.seek(SeekFrom::Current(i64::MAX)).unwrap_err().kind(),
+        ErrorKind::InvalidInput
+    );
+    assert_eq!(take.seek(SeekFrom::End(0))?, 10);
+    assert_eq!(take.seek(SeekFrom::Start(9))?, 9);
+    Ok(())
+}
+
+#[test]
+fn read_to_end_error() {
+    struct ErrorReader;
+
+    impl Read for ErrorReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("error"))
+        }
+    }
+
+    let mut r = [4, 5, 6].chain(ErrorReader);
+
+    let mut v = Vec::with_capacity(200);
+    assert!(r.read_to_end(&mut v).is_err());
+
+    assert_eq!(v, &[4, 5, 6]);
+}
+
+struct DataAndErrorReader(&'static [u8]);
+
+impl Read for DataAndErrorReader {
+    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+        panic!("We want tests to use `read_buf`")
+    }
+
+    fn read_buf(&mut self, buf: io::BorrowedCursor<'_>) -> io::Result<()> {
+        self.0.read_buf(buf).unwrap();
+        Err(io::Error::other("error"))
+    }
+}
+
+#[test]
+fn read_buf_data_and_error_take() {
+    let mut buf = [0; 64];
+    let mut buf = io::BorrowedBuf::from(buf.as_mut_slice());
+
+    let mut r = DataAndErrorReader(&[4, 5, 6]).take(1);
+    assert!(r.read_buf(buf.unfilled()).is_err());
+    assert_eq!(buf.filled(), &[4]);
+
+    assert!(r.read_buf(buf.unfilled()).is_ok());
+    assert_eq!(buf.filled(), &[4]);
+    assert_eq!(r.get_ref().0, &[5, 6]);
+}
+
+#[test]
+fn read_buf_data_and_error_buf() {
+    let mut r = BufReader::new(DataAndErrorReader(&[4, 5, 6]));
+
+    assert!(r.fill_buf().is_err());
+    assert_eq!(r.fill_buf().unwrap(), &[4, 5, 6]);
+}
+
+#[test]
+fn read_buf_data_and_error_read_to_end() {
+    let mut r = DataAndErrorReader(&[4, 5, 6]);
+
+    let mut v = Vec::with_capacity(200);
+    assert!(r.read_to_end(&mut v).is_err());
+
+    assert_eq!(v, &[4, 5, 6]);
+}
+
+#[test]
 #[cfg_attr(target_os = "emscripten", ignore)]
 fn read_until() {
     let mut buf = Cursor::new(&b"12"[..]);
@@ -234,8 +378,8 @@ fn read_buf_exact() {
 fn borrowed_cursor_advance_overflow() {
     let mut buf = [0; 512];
     let mut buf = BorrowedBuf::from(&mut buf[..]);
-    buf.unfilled().advance(1);
-    buf.unfilled().advance(usize::MAX);
+    buf.unfilled().advance_checked(1);
+    buf.unfilled().advance_checked(usize::MAX);
 }
 
 #[test]

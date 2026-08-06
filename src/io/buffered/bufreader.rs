@@ -224,7 +224,7 @@ impl<R: ?Sized> BufReader<R> {
 // This is only used by a test which asserts that the initialization-tracking is correct.
 #[cfg(test)]
 impl<R: ?Sized> BufReader<R> {
-    pub fn initialized(&self) -> usize {
+    pub fn initialized(&self) -> bool {
         self.buf.initialized()
     }
 }

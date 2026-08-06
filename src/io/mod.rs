@@ -311,7 +311,7 @@ use alloc::str;
 use alloc::string::String;
 use alloc::vec::Vec;
 use cherry_picking::memchr;
-use core::{cmp, slice};
+use core::{cmp, ptr, slice};
 mod buffered;
 pub(crate) mod copy;
 mod cursor;
@@ -367,7 +367,7 @@ where
     // SAFETY: the caller promises to only append data to `buf`
     let appended = unsafe { g.buf.get_unchecked(g.len..) };
     if str::from_utf8(appended).is_err() {
-        ret.and(Err(Error::INVALID_UTF8))
+        ret.and_then(|_| Err(Error::INVALID_UTF8))
     } else {
         g.len = g.buf.len();
         ret
@@ -399,8 +399,6 @@ pub(crate) fn default_read_to_end<R: Read + ?Sized>(
                 .checked_next_multiple_of(DEFAULT_BUF_SIZE)
         })
         .unwrap_or(DEFAULT_BUF_SIZE);
-
-    let mut initialized = 0; // Extra initialized bytes from previous loop iteration
 
     const PROBE_SIZE: usize = 32;
 
@@ -452,30 +450,20 @@ pub(crate) fn default_read_to_end<R: Read + ?Sized>(
         spare = &mut spare[..buf_len];
         let mut read_buf: BorrowedBuf<'_> = spare.into();
 
-        // SAFETY: These bytes were initialized but not filled in the previous loop
-        unsafe {
-            read_buf.set_init(initialized);
-        }
-
+        // Note that we don't track already initialized bytes here, but this is fine
+        // because we explicitly limit the read size
         let mut cursor = read_buf.unfilled();
-        loop {
+        let result = loop {
             match r.read_buf(cursor.reborrow()) {
-                Ok(()) => break,
                 Err(e) if e.is_interrupted() => continue,
-                Err(e) => return Err(e),
+                // Do not stop now in case of error: we might have received both data
+                // and an error
+                res => break res,
             }
-        }
+        };
 
-        let unfilled_but_initialized = cursor.init_ref().len();
         let bytes_read = cursor.written();
-        let was_fully_initialized = read_buf.init_len() == buf_len;
-
-        if bytes_read == 0 {
-            return Ok(buf.len() - start_len);
-        }
-
-        // store how much was initialized but not filled
-        initialized = unfilled_but_initialized;
+        let is_init = read_buf.is_init();
 
         // SAFETY: BorrowedBuf's invariants mean this much memory is initialized.
         unsafe {
@@ -483,18 +471,27 @@ pub(crate) fn default_read_to_end<R: Read + ?Sized>(
             buf.set_len(new_len);
         }
 
+        // Now that all data is pushed to the vector, we can fail without data loss
+        result?;
+
+        if bytes_read == 0 {
+            return Ok(buf.len() - start_len);
+        }
+
         // Use heuristics to determine the max read size if no initial size hint was provided
         if size_hint.is_none() {
             // The reader is returning short reads but it doesn't call ensure_init().
             // In that case we no longer need to restrict read sizes to avoid
             // initialization costs.
-            if !was_fully_initialized {
+            // When reading from disk we usually don't get any short reads except at EOF.
+            // So we wait for at least 2 short reads before uncapping the read buffer;
+            // this helps with the Windows issue.
+            if !is_init {
                 max_read_size = usize::MAX;
             }
-
             // we have passed a larger buffer than previously and the
             // reader still hasn't returned a short read
-            if buf_len >= max_read_size && bytes_read == buf_len {
+            else if buf_len >= max_read_size && bytes_read == buf_len {
                 max_read_size = max_read_size.saturating_mul(2);
             }
         }
@@ -540,8 +537,8 @@ pub(crate) fn default_read_buf<F>(read: F, mut cursor: BorrowedCursor<'_>) -> Re
 where
     F: FnOnce(&mut [u8]) -> Result<usize>,
 {
-    let n = read(cursor.ensure_init().init_mut())?;
-    cursor.advance(n);
+    let n = read(cursor.ensure_init())?;
+    cursor.advance_checked(n);
     Ok(())
 }
 
@@ -739,6 +736,19 @@ pub trait Read {
     /// returns. Any bytes which have already been read will be appended to
     /// `buf`.
     ///
+    /// # Usage Notes
+    ///
+    /// `read_to_end` attempts to read a source until EOF, but many sources are continuous streams
+    /// that do not send EOF. In these cases, `read_to_end` will block indefinitely. Standard input
+    /// is one such stream which may be finite if piped, but is typically continuous. For example,
+    /// `cat file | my-rust-program` will correctly terminate with an `EOF` upon closure of cat.
+    /// Reading user input or running programs that remain open indefinitely will never terminate
+    /// the stream with `EOF` (e.g. `yes | my-rust-program`).
+    ///
+    /// Using `.lines()` with a [`BufReader`] or using [`read`] can provide a better solution
+    ///
+    ///[`read`]: Read::read
+    ///
     /// # Examples
     ///
     /// [`File`]s implement `Read`:
@@ -816,6 +826,19 @@ pub trait Read {
     /// See [`read_to_end`] for other error semantics.
     ///
     /// [`read_to_end`]: Read::read_to_end
+    ///
+    /// # Usage Notes
+    ///
+    /// `read_to_string` attempts to read a source until EOF, but many sources are continuous streams
+    /// that do not send EOF. In these cases, `read_to_string` will block indefinitely. Standard input
+    /// is one such stream which may be finite if piped, but is typically continuous. For example,
+    /// `cat file | my-rust-program` will correctly terminate with an `EOF` upon closure of cat.
+    /// Reading user input or running programs that remain open indefinitely will never terminate
+    /// the stream with `EOF` (e.g. `yes | my-rust-program`).
+    ///
+    /// Using `.lines()` with a [`BufReader`] or using [`read`] can provide a better solution
+    ///
+    ///[`read`]: Read::read
     ///
     /// # Examples
     ///
@@ -1088,7 +1111,11 @@ pub trait Read {
     where
         Self: Sized,
     {
-        Take { inner: self, limit }
+        Take {
+            inner: self,
+            len: limit,
+            limit,
+        }
     }
 }
 
@@ -2260,6 +2287,7 @@ impl<T: SizeHint, U: SizeHint> SizeHint for Chain<T, U> {
 #[derive(Debug)]
 pub struct Take<T> {
     inner: T,
+    len: u64,
     limit: u64,
 }
 
@@ -2293,6 +2321,32 @@ impl<T> Take<T> {
         self.limit
     }
 
+    /// Returns the number of bytes that can be read before this instance will
+    /// return EOF. This is the same as the value of `limit()`, minus the
+    /// number of bytes that have been read.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::io;
+    /// use std::io::prelude::*;
+    /// use std::fs::File;
+    ///
+    /// fn main() -> io::Result<()> {
+    ///     let f = File::open("foo.txt")?;
+    ///
+    ///     // read at most five bytes
+    ///     let mut handle = f.take(5);
+    ///     handle.read(&mut [0; 4])?;
+    ///
+    ///     assert_eq!(handle.position(), 4);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn position(&self) -> u64 {
+        self.len - self.limit
+    }
+
     /// Sets the number of bytes that can be read before this instance will
     /// return EOF. This is the same as constructing a new `Take` instance, so
     /// the amount of bytes read and the previous limit value don't matter when
@@ -2317,6 +2371,7 @@ impl<T> Take<T> {
     /// }
     /// ```
     pub fn set_limit(&mut self, limit: u64) {
+        self.len = limit;
         self.limit = limit;
     }
 
@@ -2416,45 +2471,59 @@ impl<T: Read> Read for Take<T> {
             return Ok(());
         }
 
-        if self.limit <= buf.capacity() as u64 {
-            // if we just use an as cast to convert, limit may wrap around on a 32 bit target
-            let limit = cmp::min(self.limit, usize::MAX as u64) as usize;
+        if self.limit < buf.capacity() as u64 {
+            // The condition above guarantees that `self.limit` fits in `usize`.
+            let limit = self.limit as usize;
 
-            let extra_init = cmp::min(limit as usize, buf.init_ref().len());
+            let is_init = buf.is_init();
 
             // SAFETY: no uninit data is written to ibuf
-            let ibuf = unsafe { &mut buf.as_mut()[..limit] };
+            let mut sliced_buf = BorrowedBuf::from(unsafe { &mut buf.as_mut()[..limit] });
 
-            let mut sliced_buf: BorrowedBuf<'_> = ibuf.into();
-
-            // SAFETY: extra_init bytes of ibuf are known to be initialized
-            unsafe {
-                sliced_buf.set_init(extra_init);
+            if is_init {
+                // SAFETY: `sliced_buf` is a subslice of `buf`, so if `buf` was initialized then
+                // `sliced_buf` is.
+                unsafe { sliced_buf.set_init() };
             }
 
-            let mut cursor = sliced_buf.unfilled();
-            self.inner.read_buf(cursor.reborrow())?;
+            let result = self.inner.read_buf(sliced_buf.unfilled());
 
-            let new_init = cursor.init_ref().len();
+            let did_init_up_to_limit = sliced_buf.is_init();
             let filled = sliced_buf.len();
 
-            // cursor / sliced_buf / ibuf must drop here
+            // sliced_buf must drop here
+
+            // Avoid accidentally quadratic behaviour by initializing the whole
+            // cursor if only part of it was initialized.
+            if did_init_up_to_limit && !is_init {
+                // SAFETY: No uninit data will be written.
+                let unfilled_before_advance = unsafe { buf.as_mut() };
+
+                // SAFETY: 0 is a valid value for MaybeUninit<u8> and the length matches the allocation
+                let tail = &mut unfilled_before_advance[limit..];
+                unsafe {
+                    ptr::write_bytes(tail.as_mut_ptr(), 0, tail.len());
+                }
+
+                // SAFETY: `unfilled_before_advance[..limit]` was initialized by `T::read_buf`, and
+                // `unfilled_before_advance[limit..]` was just initialized.
+                unsafe { buf.set_init() };
+            }
 
             unsafe {
-                // SAFETY: filled bytes have been filled and therefore initialized
-                buf.advance_unchecked(filled);
-                // SAFETY: new_init bytes of buf's unfilled buffer have been initialized
-                buf.set_init(new_init);
+                // SAFETY: filled bytes have been filled
+                buf.advance(filled);
             }
 
             self.limit -= filled as u64;
+
+            result
         } else {
             let written = buf.written();
-            self.inner.read_buf(buf.reborrow())?;
+            let result = self.inner.read_buf(buf.reborrow());
             self.limit -= (buf.written() - written) as u64;
+            result
         }
-
-        Ok(())
     }
 }
 impl<T: BufRead> BufRead for Take<T> {
@@ -2488,6 +2557,42 @@ impl<T: SizeHint> SizeHint for Take<T> {
             Some(upper_bound) => Some(cmp::min(upper_bound as u64, self.limit) as usize),
             None => self.limit.try_into().ok(),
         }
+    }
+}
+
+impl<T: Seek> Seek for Take<T> {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        let new_position = match pos {
+            SeekFrom::Start(v) => Some(v),
+            SeekFrom::Current(v) => self.position().checked_add_signed(v),
+            SeekFrom::End(v) => self.len.checked_add_signed(v),
+        };
+        let new_position = match new_position {
+            Some(v) if v <= self.len => v,
+            _ => return Err(ErrorKind::InvalidInput.into()),
+        };
+        while new_position != self.position() {
+            // Compute the signed difference `new_position - self.position()`
+            // as an `i64`, if it fits.
+            let diff = new_position as i128 - self.position() as i128;
+            if let Ok(offset) = i64::try_from(diff) {
+                self.inner.seek_relative(offset)?;
+                self.limit = self.limit.wrapping_sub(offset as u64);
+                break;
+            }
+            let offset = if new_position > self.position() {
+                i64::MAX
+            } else {
+                i64::MIN
+            };
+            self.inner.seek_relative(offset)?;
+            self.limit = self.limit.wrapping_sub(offset as u64);
+        }
+        Ok(new_position)
+    }
+
+    fn stream_len(&mut self) -> Result<u64> {
+        Ok(self.len)
     }
 }
 
